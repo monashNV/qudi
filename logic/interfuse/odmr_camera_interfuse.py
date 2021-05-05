@@ -99,6 +99,7 @@ class ODMRCameraInterfuse(GenericLogic, MicrowaveInterface, CameraInterface, Pul
         """
 
         # Set up the camera ... not sure what goes here yet
+        # We either want kinetic series or run until abort acqusition mods
 
         # The pulse sequence should be trigger+acquire together, with mw_x always on
         self.pulser.write_waveform()
