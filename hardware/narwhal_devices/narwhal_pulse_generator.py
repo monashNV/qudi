@@ -52,6 +52,14 @@ class PulseStreamer(Base, PulserInterface):
     __current_waveform_name = StatusVar(name='current_waveform_name', default='')
     __sample_rate = StatusVar(name='sample_rate', default=1e9)
 
+    _laser_channel = ConfigOption('laser_channel', default=0, missing='warn')
+    _mw_x_channel = ConfigOption('mw_x_channel', default=1, missing='warn')
+    _mw_xb_channel = ConfigOption('mw_xb_channel', default=2, missing='warn')
+    _mw_y_channel = ConfigOption('mw_y_channel', default=3, missing='warn')
+    _mw_yb_channel = ConfigOption('mw_yb_channel', default=4, missing='warn')
+    _odmr_freq_step_trigger = ConfigOption('odmr_freq_step_trigger', default=5, missing='warn')
+    _camera_trigger = ConfigOption('camera_trigger', default=6, missing='warn')
+
 
     def __init__(self, config, **kwargs):
         super().__init__(config=config, **kwargs)
@@ -60,7 +68,6 @@ class PulseStreamer(Base, PulserInterface):
         self.__currently_loaded_waveform = ''  # loaded and armed waveform name
         self.__samples_written = 0
         self._trigger = 'software'
-        #todo: self._laser_mw_on_state = ps.OutputState([self._laser_channel, self._uw_x_channel], 0, 0)
 
     def on_activate(self):
         """ Establish connection to pulse streamer and tell it to cancel all operations """
@@ -70,11 +77,10 @@ class PulseStreamer(Base, PulserInterface):
 
         self.__samples_written = 0
         self.__currently_loaded_waveform = ''
-        self.current_status = 0
 
     def on_deactivate(self):
         #self.reset()
-        del self.pulse_streamer
+        del self.pg
 
     
     def get_constraints(self):
@@ -184,21 +190,22 @@ class PulseStreamer(Base, PulserInterface):
         constraints.sample_rate.max = 100e6
         constraints.sample_rate.step = 0
         constraints.sample_rate.default = 100e6
+        constraints.sample_rate.unit = 'Hz'
 
         constraints.d_ch_low.min = 0.0
         constraints.d_ch_low.max = 0.0
         constraints.d_ch_low.step = 0.0
         constraints.d_ch_low.default = 0.0
+        constraints.d_ch_low.unit = 'V'
 
         constraints.d_ch_high.min = 3.3
         constraints.d_ch_high.max = 3.3
         constraints.d_ch_high.step = 0.0
         constraints.d_ch_high.default = 3.3
+        constraints.d_ch_low.unit = 'V'
 
-        # sample file length max is not well-defined for PulseStreamer, which collates sequential identical pulses into
-        # one. Total number of not-sequentially-identical pulses which can be stored: 1 M.
         constraints.waveform_length.min = 1
-        constraints.waveform_length.max = 134217728
+        constraints.waveform_length.max = 2**48-1 # max delay length in clock units
         constraints.waveform_length.step = 1
         constraints.waveform_length.default = 1
 
@@ -220,9 +227,7 @@ class PulseStreamer(Base, PulserInterface):
         @return int: error code (0:OK, -1:error)
         """
         if self._seq:
-            self.pulse_streamer.stream(self._seq)
-            self.pulse_streamer.startNow()
-            self.__current_status = 1
+            self.pg.write_action(trigger_now=True)
             return 0
         else:
             self.log.error('no sequence/pulse pattern prepared for the pulse streamer')
@@ -237,9 +242,12 @@ class PulseStreamer(Base, PulserInterface):
         @return int: error code (0:OK, -1:error)
         """
 
-        self.__current_status = 0
-        self.pulse_streamer.constant(self._laser_mw_on_state)
+        self.pg.write_action(reset_output_coordinator=True)
         return 0
+
+
+    def _laser_on(self):
+
 
     
     def load_waveform(self, load_dict):
