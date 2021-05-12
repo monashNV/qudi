@@ -544,7 +544,7 @@ class IxonUltra(Base, CameraInterface):
     def _set_temperature(self, temp):
         temp = c_int(temp)
         error_code = self.dll.SetTemperature(temp)
-        return  ERROR_DICT[error_code]
+        return ERROR_DICT[error_code]
 
     def _set_acquisition_mode(self, mode):
         """
