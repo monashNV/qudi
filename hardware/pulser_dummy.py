@@ -21,7 +21,9 @@ top-level directory of this distribution and at <https://github.com/Ulm-IQO/qudi
 """
 
 import time
+import re
 from collections import OrderedDict
+import numpy as np
 
 from core.module import Base
 from core.statusvariable import StatusVar
@@ -53,7 +55,7 @@ class PulserDummy(Base, PulserInterface):
         self.log.info('Dummy Pulser: I will simulate an AWG :) !')
 
         self.connected = False
-        self.sample_rate = 25e9
+        self.sample_rate = 12e9
 
         # Deactivate all channels at first:
         self.channel_states = {'a_ch1': False, 'a_ch2': False, 'a_ch3': False,
@@ -316,7 +318,48 @@ class PulserDummy(Base, PulserInterface):
         self.waveform_set.update(waveforms)
 
         self.log.info('Waveforms with nametag "{0}" directly written on dummy pulser.'.format(name))
+        self.digital_samples = digital_samples
+        self.make_narwhal(digital_samples, number_of_samples)
         return number_of_samples, waveforms
+
+    def make_narwhal(self, digital_samples, number_of_samples):
+        print(digital_samples)
+        num_channels = len(digital_samples)
+
+        # group everything into a single array
+        channel_labels = []
+        for i,channel_key in enumerate(digital_samples):
+            if i == 0:
+                channel_array = digital_samples[channel_key]
+            else:
+                channel_array = np.vstack((channel_array, digital_samples[channel_key]))
+
+            channel_labels.append(int(re.search(r'd_ch(\d+)', channel_key).group(1))-1) # in Narwhal channel units i.e. zero-based
+
+        self.channel_labels = channel_labels
+        channel_order = np.argsort(channel_labels)
+        print(channel_order)
+        channel_array[:, :] = channel_array[channel_order, :]
+
+        channel_array = np.insert(channel_array, 0, np.zeros(num_channels).astype(np.bool_), axis=1)
+        channel_array = np.insert(channel_array, number_of_samples, np.zeros(num_channels).astype(np.bool_), axis=1)
+        self.channel_array = channel_array
+
+        # find if previous step is different
+        diffs = np.logical_xor(channel_array[:, 1:], channel_array[:, :-1])
+        # self.diffs1 = diffs
+        diffs = np.any(diffs, axis=0)
+        # self.diffs2 = diffs
+        locations = np.where(diffs)[0]
+
+        bits = channel_array[:, locations]
+        # the first element of channel_array is actually lowest bit, so need to flip the order
+        bits = np.packbits(bits, axis=0, bitorder='little')
+        times = locations
+        times = np.insert(times, 0, 0)
+        times = times[1:]-times[:-1]
+
+        return times, bits
 
     def write_sequence(self, name, sequence_parameter_list):
         """
