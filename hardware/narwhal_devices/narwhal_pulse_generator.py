@@ -27,6 +27,7 @@ from core.util.modules import get_home_dir
 from interface.pulser_interface import PulserInterface, PulserConstraints
 from collections import OrderedDict
 import numpy as np
+import re
 
 import ndpulsegen
 import time
@@ -66,6 +67,9 @@ class PulseGenerator(Base, PulserInterface):
         self._currently_loaded_waveform = ''  # loaded and armed waveform name
         self._samples_written = 0
         self._trigger = 'software'
+        self._max_instructions = int(2**13)
+        self._waveforms = dict()
+        self._free_memory = np.ones(self._max_instructions).astype(np.bool_)
 
     def on_activate(self):
         """ Establish connection to pulse generator and tell it to cancel all operations """
@@ -221,7 +225,7 @@ class PulseGenerator(Base, PulserInterface):
 
         @return int: error code (0:OK, -1:error)
         """
-        if self._seq:
+        if True: #Should be something here
             self.pg.write_action(trigger_now=True)
             return 0
         else:
@@ -276,7 +280,7 @@ class PulseGenerator(Base, PulserInterface):
         Please note that the channel index used here is not to be confused with the number suffix
         in the generic channel descriptors (i.e. 'd_ch1', 'a_ch1'). The channel index used here is
         highly hardware specific and corresponds to a collection of digital and analog channels
-        being associated to a SINGLE wavfeorm asset.
+        being associated to a SINGLE waveform asset.
         """
         if isinstance(load_dict, list):
             waveforms = list(set(load_dict))
@@ -321,7 +325,6 @@ class PulseGenerator(Base, PulserInterface):
         asset_dict = {chnl_num: self._currently_loaded_waveform for chnl_num in range(1, 9)}
         return asset_dict, asset_type
 
-
     
     def load_sequence(self, sequence_name):
         """ Loads a sequence to the channels of the device in order to be ready for playback.
@@ -345,7 +348,6 @@ class PulseGenerator(Base, PulserInterface):
         return dict()
 
 
-    
     def clear_all(self):
         """ Clears all loaded waveforms from the pulse generators RAM/workspace.
 
@@ -615,7 +617,59 @@ class PulseGenerator(Base, PulserInterface):
         }
         return d_ch_dict
 
-    
+    def make_instructions_from_digital_samples(self, digital_samples):
+
+        """
+        Takes the qudi digital samples (dict of sample rate spaced bool value arrays) and creates the times and
+        bit values for programming a Narwhal (or SpinCore) device
+
+        @param dict digital_samples: keys are the generic digital channel names (i.e. 'd_ch1') and
+                                     values are 1D numpy arrays of type bool containing the marker
+                                     states.
+
+        @return (np.array, np.array, int): the times and bits of the instruction list and the number of samples in qudi
+        sample rate
+        """
+
+        num_channels = len(digital_samples)
+
+        # group everything into a single array
+        channel_labels = []
+        for i, channel_key in enumerate(digital_samples):
+            if i == 0:
+                channel_array = digital_samples[channel_key]
+                number_of_samples = len(channel_array)
+            else:
+                channel_array = np.vstack((channel_array, digital_samples[channel_key]))
+
+            # in Narwhal channel units i.e. zero-based
+            channel_labels.append(int(re.search(r'd_ch(\d+)', channel_key).group(1))-1)
+
+        # resort the channel array by Narwhal units channel index -> [0,1,2,3,4,5,...23]
+        channel_array[:, :] = channel_array[np.argsort(channel_labels), :]
+
+        # Add row before and after array to make row-wise comparisons easier
+        channel_array = np.insert(channel_array, 0, np.zeros(num_channels).astype(np.bool_), axis=1)
+        channel_array = np.insert(channel_array, number_of_samples, np.zeros(num_channels).astype(np.bool_), axis=1)
+
+        # find if previous step is different
+        diffs = np.logical_xor(channel_array[:, 1:], channel_array[:, :-1])
+        # is there a difference in any channel?
+        diffs = np.any(diffs, axis=0)
+        # find the location of the differences
+        locations = np.where(diffs)[0]
+        # get the values of the channels at the change
+        bits = channel_array[:, locations]
+        # the first column of channel_array is actually lowest bit, so need to flip the order
+        bits = np.packbits(bits, axis=0, bitorder='little')
+        # times are already in clock units (steps)
+        times = locations
+        times = np.insert(times, 0, 0)
+        # duration of the instruction is the difference in the times
+        times = times[1:]-times[:-1]
+
+        return times, bits, number_of_samples
+
     def write_waveform(self, name, analog_samples, digital_samples, is_first_chunk, is_last_chunk,
                        total_number_of_samples):
         """
@@ -633,7 +687,7 @@ class PulseGenerator(Base, PulserInterface):
                                      values are 1D numpy arrays of type bool containing the marker
                                      states.
         @param bool is_first_chunk: Flag indicating if it is the first chunk to write.
-                                    If True this method will create a new empty wavveform.
+                                    If True this method will create a new empty waveform.
                                     If False the samples are appended to the existing waveform.
         @param bool is_last_chunk:  Flag indicating if it is the last chunk to write.
                                     Some devices may need to know when to close the appending wfm.
@@ -645,33 +699,36 @@ class PulseGenerator(Base, PulserInterface):
         """
 
         if analog_samples:
-            self.log.debug('Analog not yet implemented for pulse streamer')
+            self.log.debug('Narwhal has no analog outputs')
             return -1, list()
 
         if is_first_chunk:
-            self._current_waveform_name = name
+
+            self._waveforms[name] = dict()
             self._samples_written = 0
-            # initalise to a dict of lists that describe pulse pattern in swabian language
-            self._current_waveform = {key:[] for key in digital_samples.keys()}
 
-        for channel_number, samples in digital_samples.items():
-            new_channel_indices = np.where(samples[:-1] != samples[1:])[0]
-            new_channel_indices = np.unique(new_channel_indices)
+            times, bits, number_of_samples = self.make_instructions_from_digital_samples(digital_samples)
+            num_instructions = len(bits)
+            # find a suitable length chunk of instruction memory
+            for start in range(self._max_instructions):
+                if self._free_memory[start:start+num_instructions].all():
+                    self._waveforms[name]['start_memory'] = start
+                    self._free_memory[start:start+num_instructions] = False
+                    break
+            else:
+                self.log.error('Not enough available instruction memory for waveform: {0}'.format(name))
 
-            # add in indices for the start and end of the sequence to simplify iteration
-            new_channel_indices = np.insert(new_channel_indices, 0, [-1])
-            new_channel_indices = np.insert(new_channel_indices, new_channel_indices.size, [samples.shape[0] - 1])
-            pulses = []
-            for new_channel_index in range(1, new_channel_indices.size):
-                pulse = [new_channel_indices[new_channel_index] - new_channel_indices[new_channel_index - 1],
-                         samples[new_channel_indices[new_channel_index - 1] + 1].astype(np.byte)]
-                pulses.append(pulse)
+            self._waveforms[name]['instructions'] = []
+            for mi in range(num_instructions):
+                # address, state, countdown, loopto_address, loops, stop_and_wait_tag, hard_trig_out_tag, notify_computer_tag
+                self._waveforms[name]['instructions'].append(ndpulsegen.transcode.encode_instruction(mi + self._waveforms[name]['start_memory'],
+                                                             bits[mi], times[mi], 0, 0, False, False, False))
 
-            # extend (as opposed to rewrite) for chunky business
-            #print(pulses)
-            self.__current_waveform[channel_number].extend(pulses)
+        else:
+            pass
 
-        return len(samples), [self.__current_waveform_name]
+
+        return number_of_samples, [self._current_waveform_name]
 
 
     
@@ -697,7 +754,7 @@ class PulseGenerator(Base, PulserInterface):
         @return list: List of all uploaded waveform name strings in the device workspace.
         """
         waveform_names = list()
-        if self.__current_waveform_name != '' and self.__current_waveform_name is not None:
+        if self._current_waveform_name != '' and self._current_waveform_name is not None:
             waveform_names = [self.__current_waveform_name]
         return waveform_names
 
@@ -751,7 +808,7 @@ class PulseGenerator(Base, PulserInterface):
         Unused for pulse generator hardware other than an AWG.
         """
         if state:
-            self.log.error('No interleave functionality available in FPGA pulser.\n'
+            self.log.error('No interleave functionality available in Narwhal pulser.\n'
                            'Interleave state is always False.')
         return False
 
